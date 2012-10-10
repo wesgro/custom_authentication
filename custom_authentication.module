@@ -1,0 +1,235 @@
+<?php
+define('EXTERNAL_AUTH_RID', '3');
+/**
+* Implementation of hook_help().
+*/
+function custom_authentication_help( $path, $arg )
+{
+    switch ( $path )
+    {
+        case 'admin/help#custom_authentication':
+        {
+            return( '<p>' . t('This module allows users who login with e-mail addresses to authenticate off an external system.') . '</p>' );
+        }
+    }
+}
+
+/**
+   * Implementation of hook_form_alter().
+   *
+   * Change the normal form login form behaviour.
+   */
+function custom_authentication_form_user_login_alter( &$form, $form_state )
+{
+    unset($form['links']);
+    $form['#validate'] = array(  'user_login_name_validate', 'custom_authentication_login_validate', 'user_login_final_validate' );
+}
+
+function custom_authentication_form_user_login_block_alter( &$form, $form_state )
+{
+  return custom_authentication_form_user_login_alter( $form, $form_state );
+}
+
+/**
+* The custom_authentication_auth() function attempts to authenticate a user off the external system using their e-mail address.
+*/
+function custom_authentication_login_validate( $form, &$form_state )
+{
+    $username = $form_state['values']['name'];
+	;
+    // In our case if the user isn't already found in the system, we're going to check the credentials against our external system.
+    if ( user_authenticate($form_state['values']) === NULL )
+    {
+		
+        // Look for user in external database
+        if ( externalUserExists( $username ))
+        {
+            // Looks like we found them - now we need to check if the password is correct
+            if ( externalUserValidPassword( $username, $form_state['values']['pass'] ))
+            {
+                user_external_login_register( $username, 'custom_authentication' );
+                user_authenticate_finalize( $form_state['values'] );
+            } // else drop through to the end and return nothing - Drupal will handle the rejection for us
+        }
+    }
+    else
+    {
+        // Username is not an e-mail address, so use standard Drupal authentication function
+        @user_login_authenticate_validate( $form, $form_state );
+    }
+}
+
+/**
+* The custom_authentication_user() function gets called by Drupal after a new user has been added. If the e-mail address has
+* already been set then we don't want to overwrite it, as the user is probably being added manually. Thankfully
+* the only time a user can be added without the e-mail being set is when custom_authentication_auth() gets run for a first-time
+* user, at which point a user is inserted without an e-mail address. That is the case we're dealing with in this
+* function.
+*/
+function custom_authentication_user( $op, &$edit, &$account, $category = null )
+{
+    switch( $op )
+    {
+        case( 'insert' ): // This hook is called during the registration process, AFTER the new user has been added to the users table but BEFORE the roles are written to the users_roles table
+        {
+            if ( empty( $account->mail ))
+            {
+				$email = find_email( $account->name );
+				$password = md5( find_password( $account->name ) );
+                db_query("UPDATE {users} SET mail = '%s', pass = '%s' WHERE uid = %d", $email, $password, $account->uid);
+            }
+           
+            // Note: you can do other stuff here, like set the password to be the md5 hash of the remote password. This might be handy if you wanted to allow people to log on when the external system is unavailable, but, of course, it introduces the hassle of keeping the passwords in sync.
+
+            // This is where we set that additional role to indicate that the user is authenticated externally. Note that EXTERNAL_AUTH_RID is undefined in this sample code but would normally be set to whatever Role ID is in the database. (So that is, create the new role, do a query to find the RID for that role and set EXTERNAL_AUTH_RID to that RID. Or just hard code it in the following line.)
+            $edit['roles'][EXTERNAL_AUTH_RID] = 'CAB member';
+            return;
+        }
+		//update user email on load to match with database
+		case ( 'login' ):
+		{
+			$is_active = find_active($account->name);
+			
+			if($is_active === FALSE && isset($account->roles[EXTERNAL_AUTH_RID])){
+				$email = find_email( $account->name );
+				if($email !== FALSE){
+					watchdog('custom_authentication', 'Updating Email for user account %name to %email', array('%name' => $account->name, '%email' => $email), WATCHDOG_NOTICE);
+					db_query("UPDATE {users} SET mail = '%s' WHERE uid = %d", $email, $account->uid);
+				}
+			
+				watchdog('custom_authentication', 'User %name is not active in members database, logging them out', array('%name' => $account->name), WATCHDOG_NOTICE);
+				
+				session_destroy();
+				// Only variables can be passed by reference workaround.
+				$null = NULL;
+				user_module_invoke('logout', $null, $account);
+				
+				// Load the anonymous user
+				$user = drupal_anonymous_user();
+				
+				drupal_goto();
+				//print_r($user);
+				//drupal_set_message( 'Sorry, you are no longer an active member of the CAB. Please <a href="/content/contact-form">contact us</a> if you believe this is an error', 'error' );
+				
+			}
+			return;
+		}
+		
+        case( 'update' ): // This hook is called BEFORE the record in the database (or $account) has been updated
+        {
+            if ( strpos( $account->name, '@' ) !== false )
+            {
+                // If the user is identified by their e-mail address and they are trying to change their e-mail address, don't let them.
+                if ( strcmp( $account->mail, $edit['mail'] ))
+                {
+                    unset( $edit['mail']);
+                    drupal_set_message( 'Sorry, users who use their e-mail address to login cannot change their e-mail address.', 'error' );
+                }
+
+                // If the user is identified by their e-mail address and they are trying to change their password, don't let them.
+                if ( $edit['pass'] != '' )
+                {
+                    unset( $edit['pass']);
+                    drupal_set_message( 'Please access the external system to change your password.', 'error' );
+                }
+            }
+
+            return;
+        }
+    }
+}
+
+/*
+* Helper functions that you will need to implement
+*/
+function externalUserExists( $username )
+{
+	//parse username
+	list($firstname, $lastname) = explode(" ", $username, 2);
+	
+	watchdog('custom_authentication', 'Checking for new external user: %name using module %module.', array('%name' => $firstname ." ".$lastname, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+	$sql = "SELECT * FROM cab_members 
+			WHERE first_name = '%s' 
+			AND last_name = '%s'
+			AND active = -1
+			LIMIT 1";
+	$result = db_query($sql , $firstname, $lastname);
+	$return = db_fetch_array($result);
+	
+	if($return !== FALSE){
+		watchdog('custom_authentication', 'Username: %name found using module %module.', array('%name' => $firstname ." ".$lastname, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+		return true;
+	}else{
+		return false;
+	}
+}
+
+function externalUserValidPassword( $username, $password )
+{
+    watchdog('custom_authentication', 'Checking password for new external user: %name using module %module.', array('%name' => $username, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+	$sql = "SELECT * FROM cab_members 
+			WHERE password = '%s'
+			AND active = -1
+			LIMIT 1";
+	$result = db_query($sql , $password);
+	$return = db_fetch_array($result);
+	
+	if($return !== FALSE){
+		watchdog('custom_authentication', 'Username: %name password was correct using module %module.', array('%name' => $username, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+		return true;
+	}else{
+		watchdog('custom_authentication', 'Username: %name password was incorrect using module %module.', array('%name' => $username, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+		return false;
+	}
+}
+
+function find_password($username){
+	list($firstname, $lastname) = explode(" ", $username, 2);
+	$sql = "SELECT `password` FROM cab_members 
+			WHERE first_name = '%s' 
+			AND last_name = '%s'
+			AND active = -1
+			LIMIT 1";
+	$result = db_query($sql , $firstname, $lastname);
+	$return = db_fetch_array($result);
+	if($return !== FALSE){
+		return $return['password'];
+	}else{
+		watchdog('custom_authentication', 'Username: %name was not found via find_password() in module %module.', array('%name' => $username, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+		return false;
+	}
+}
+
+function find_email($username){
+	list($firstname, $lastname) = explode(" ", $username, 2);
+	$sql = "SELECT `email_address` FROM cab_members 
+			WHERE first_name = '%s' 
+			AND last_name = '%s'
+			AND active = -1
+			LIMIT 1";
+	$result = db_query($sql , $firstname, $lastname);
+	$return = db_fetch_array($result);
+	if($return !== FALSE){
+		return $return['email_address'];
+	}else{
+		watchdog('custom_authentication', 'Username: %name was not found via find_email() in module %module.', array('%name' => $username, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+		return false;
+	}
+}
+function find_active($username){
+	list($firstname, $lastname) = explode(" ", $username, 2);
+	$sql = "SELECT `active` FROM cab_members 
+			WHERE first_name = '%s' 
+			AND last_name = '%s'
+			AND active = -1
+			LIMIT 1";
+	$result = db_query($sql , $firstname, $lastname);
+	$return = db_fetch_array($result);
+	if($return !== FALSE){
+		return true;
+	}else{
+		watchdog('custom_authentication', 'Username: %name was not found to be active via find_active() in module %module.', array('%name' => $username, '%module' => 'Custom Authentication'), WATCHDOG_NOTICE);
+		return false;
+	}
+}
+?>
